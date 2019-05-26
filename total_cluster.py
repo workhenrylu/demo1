@@ -5,16 +5,20 @@ from sklearn.cluster import KMeans
 from sklearn import metrics
 from datetime import date
 import re
+from datetime import datetime
 
+#  获得一个OD整体的表（新车+老车调整）
+#  流程是循环oooodlist中的od，，取到所有od时间切割的交集，即是最细的时间切割，每个od查询new 和 old 车次，concat在一起
 
-class SqlOperation():
+class TableGet():
+
     def __init__(self, today, day1, odb, ode):
         self.Gbase = ConnectToGbase.ConnetcToGbase()
         self.today = today
         self.day1 = day1
         self.odb = odb
         self.ode = ode
-
+        self.num1 = self.get_ave_num(self.day1, self.today)
 
     def get_ave_num(self, date_start, date_end):
         sql = f"select sum(up_num)/(" + date_end + "-" + date_start + ") as num from rmdssdb.ttrms_upnum_from_statistics_result " \
@@ -22,6 +26,7 @@ class SqlOperation():
               + self.odb + "' and to_station_telecode = '" + self.ode + "'"
 
         rows = self.Gbase.getManyRows(sql)
+        print('--------get data successful----------')
         return float(re.findall(r"\d+\.?\d*", str(rows))[0])
 
     def get_nearest_table(self, date_start, date_end):
@@ -38,23 +43,17 @@ class SqlOperation():
         basic_table = pd.DataFrame(list(rows),
                                    columns=['train_code', 'depart_date', 'up_num', 'start_time_int', 'tra_time',
                                             'from_station_telecode', 'to_station_telecode'])
-        print('connect successful')
-
-        return basic_table
-
-    def get_train_list(self, date_start, date_end):
-        date_start = date_start
-        date_end = date_end
-        basic_table = self.get_nearest_table(date_start, date_end)
+        print('get neareat table successful')
         train_lst = [i.strip() for i in list(basic_table['train_code'].unique())]
-        return train_lst
+        return (basic_table, train_lst)
+        #返回值是一个dataframe和一个list
 
     def get_gamma(self, date_start, date_end):
-        num1 = self.get_ave_num(self.day1, self.today)
+
         date_start=date_start
         date_end=date_end
         num2 = self.get_ave_num(date_start, date_end)
-        return num1/num2
+        return self.num1/num2
 
     def get_old(self, date_start, date_end, gamma, train_lst):
         sql = f"select A.train_code,A.depart_date,sum(up_num)* "+str(gamma)+"as up_num,cast(substring(start_time,1,2) as int)+" \
@@ -72,6 +71,64 @@ class SqlOperation():
                                    columns=['train_code', 'depart_date', 'up_num', 'start_time_int', 'tra_time',
                                             'from_station_telecode', 'to_station_telecode'])
         return basic_table
+
+#  出结果
+
+
+class Find():
+
+    def __init__(self):
+        self.Gbase2 = ConnectToGbase.ConnetcToGbase()
+
+    def __get_date_lst(self, odb, ode):
+        sql = f"select date_format(start_date,'%Y%m%d') as date from rmdssdb.od_date_split " \
+              f"where from_station_telecode = '"+odb+"' and to_station_telecode = '"+ode+"' and start_date >'2016-01-01' order by date desc"
+        rows = self.Gbase2.getManyRows(sql)
+        print('--------get data list successful----------')
+        lst = [list(i)[0] for i in rows]
+        #print(lst)
+        if len(lst) >= 1:
+            return lst
+        else:
+            return ['20160101', '20190511']
+
+    def get_totallist(self, ood_code):
+        od_code = ood_code
+        #today = str(date.today()).replace("-", "")
+        date_list = []
+        for n in range(0, len(od_code)):
+            date_list_tmp = Find().__get_date_lst(od_code[n][0], od_code[n][1])
+            date_list = date_list + date_list_tmp
+            date_list = list(set(date_list))
+
+        date_list.sort(reverse=True)
+        date_list = [today] + date_list
+        print(date_list)
+        return date_list
+
+    def to_you_table(self, od_code):
+        ood_code = od_code
+        date_list = self.get_totallist(ood_code)
+        #  得到total时间切割
+
+        tb = pd.DataFrame()
+        for m in range(0, len(ood_code)):
+
+            tb_temp = TableGet(date_list[0], date_list[1], ood_code[m][0], ood_code[m][1])
+            tb_lst_combine = tb_temp.get_nearest_table(date_list[1], date_list[0])
+            table = pd.DataFrame(tb_lst_combine[0])
+            if len(date_list) > 2:
+                if len(table) > 0:
+                    train_lst = tb_lst_combine[1]
+
+                    for i in range(1, len(date_list) - 1):
+                        gma = tb_temp.get_gamma(date_list[i + 1], date_list[i])
+                        old_table_tmp = pd.DataFrame(tb_temp.get_old(date_list[i + 1], date_list[i], gma, train_lst))
+                        table = pd.concat([table, old_table_tmp])
+            tb = pd.concat([tb, table])
+
+        return processing(tb)
+
 
 def processing(basic_table):
     #  取出的数据格式不对，要调整一下
@@ -92,8 +149,8 @@ def processing(basic_table):
     final_table['bottom'] = final_table['mean'] - final_table['std']
     final_table = final_table.dropna()
 
-    if len(final_table) > 2:
-        #  控制传入车次的数量一定要大于2，否则后面的kmeans无法用
+    if len(final_table) > 3:
+        #  控制传入车次的数量一定要大于3，否则后面的kmeans无法用
         #  minmax简单对数据进行处理
         final_table['mean'] = (final_table['mean'] - min(final_table['mean'])) / (
                     max(final_table['mean']) - min(final_table['mean']))
@@ -115,8 +172,8 @@ def processing(basic_table):
 
     #  调整最后的输出表
     result = final_table[['train_code', 'start_time_int', 'tra_time', 'from_station_telecode',
-                          'to_station_telecode', 'cluster_label']]
-    result['start_depart_date'] = date_list[-1]
+                          'to_station_telecode', 'cluster_label']].copy()
+    result['start_depart_date'] = '20160101'
     result['end_depart_date'] = today
     result = result[
         ['start_depart_date', 'end_depart_date', 'from_station_telecode', 'to_station_telecode', 'train_code',
@@ -147,22 +204,15 @@ class KMeansAlg:
 
 if __name__ == "__main__":
 
+    s = datetime.now()
 
-    od_code = [['AOH', 'VNP']]
     today = str(date.today()).replace("-", "")
-    date_list = [today, '20180410', '20180322', '20160101']
 
+    ooood_code = [['KQW', 'AOH']]
+    #  返回dataframe
+    print(Find().to_you_table(ooood_code))
 
-    t = SqlOperation(date_list[0], date_list[1], od_code[0][0], od_code[0][1])
-    tb = pd.DataFrame(t.get_nearest_table(date_list[1], date_list[0]))
-    tlst = t.get_train_list(date_list[1], date_list[0])
+    e = datetime.now()
 
-    for i in range(1, len(date_list)-1) :
-        gma = t.get_gamma(date_list[i+1], date_list[i])
-        otb = pd.DataFrame(t.get_old(date_list[i+1], date_list[i], gma, tlst))
-        tb = pd.concat([tb, otb])
-
-    tb = processing(tb)
-    print(tb)
-
+    print('程序时间', e-s)
 
